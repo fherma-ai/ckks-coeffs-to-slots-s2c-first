@@ -1,171 +1,61 @@
-# CKKS CoeffsToSlots, S2C-first — a submission
+# CKKS CoeffsToSlots, S2C-first — reference implementation
 
-A submission to the specification `coeffs-to-slots/s2c@1.0.0`: one call to
-Poulpy's CoeffsToSlots — the homomorphic encode DFT that moves a raised
-ciphertext's coefficients into the slots of two ciphertexts, the real parts in
-one and the imaginary parts in the other — timed. It is the third stage of
-Poulpy's S2C-first bootstrapping (`SlotsToCoeffs → ModUp → CoeffsToSlots →
-EvalMod`) and, at this point, 55–60 % of its time. Poulpy 0.8.3, toolchain
+A submission to `coeffs-to-slots/s2c@1.0.0` on FHERMA: the CoeffsToSlots stage of Poulpy's S2C-first CKKS bootstrapping — more than half of its time — timed on its own. Poulpy 0.8.3, toolchain
 `nightly-2026-05-14`.
 
-This directory is the reference implementation, and the harness the platform
-measures every submission in: `fherma.toml [harness]` says which files are
-the specification's (pinned — laid over every submission's clone) and which
-are the author's. The reference is the harness with `src/init.rs`, `run.rs`
-and `free.rs` as they ship, built on the fastest backend Poulpy has
-(`ifma-rayon`, every core). A submission that keeps them competes on backend
-and threads; one that replaces `run.rs` competes on the algorithm and must
-produce the same bytes.
+This repository is the reference implementation: the answer every
+submission is compared to, and the harness every submission is measured in.
 
-## The stage's contract
+## Attribution
 
-The stage is exactly what `ckks_bootstrap` does between its ModUp and its
-EvalMod, and the composition test in `../ckks-stages-check` is what says so:
-the stages chained through this crate's code reproduce the one-shot
-bootstrap byte for byte.
+[Poulpy](https://github.com/poulpy-fhe/poulpy) is an open-source homomorphic
+encryption library developed by the Poulpy project ([poulpy.dev](https://www.poulpy.dev/))
+and released under the Apache License 2.0. The bootstrapping, its parameter
+set and its implementation are Poulpy's. This repository calls Poulpy through
+its public API in order to measure it on [FHERMA](https://www.fherma.io); it
+claims no authorship of the library or of the algorithm, and FHERMA is not
+affiliated with the Poulpy project.
 
-| | |
-|---|---|
-| Input | the raised ciphertext: the case's message encrypted at the input layout (160 bits), through the reference SlotsToCoeffs (→ 48 bits) and ModUp with sparse-secret encapsulation (→ 1382 bits, `log_delta` 54, the six C2S guard bits fused into the raise). Made by `generate`, not measured |
-| Operation | `ckks_coeffs_to_slots_split` on the preset's compiled CoeffsToSlots matrix (four factors, schedule `(4,8192)(4,512)(4,32)(3,4)`) with the rotation keys, conjugation among them |
-| Output | two ciphertexts at 1184 bits: `re` holds the input's first `N/2` coefficients in its slots (bit-reversed order), `im` the second `N/2` |
-| Metadata | after the transform, `log_delta` of both halves reduced by the six guard bits — what the orchestrator does before EvalMod, so what the next stage sees is what this one leaves |
-
-## Files
-
-Three functions are yours; the envelope and the loop are the platform's:
-
-| File | Owner | Role |
-|---|---|---|
-| `src/init.rs` | **you** | `init(&Point, &Context, config) → State`: your setup over the point and the context — the output buffers, a working arena, keys onto a GPU. Never sees a case. Not measured |
-| `src/run.rs` | **you** | `run(&mut State, &Input) → &Output` — CoeffsToSlots into the two halves. **The only thing timed** |
-| `src/free.rs` | **you** | `free(State)`: your teardown. Not measured |
-| `Cargo.toml` | **you** | the backend, as one cargo feature under `[features] default` |
-| `config.jsonc` | **you** | `threads`, for a `*-rayon` backend; `0` is every core |
-| `rust-toolchain.toml` | you | `nightly-2026-05-14`; Poulpy needs nightly |
-| `src/envelope/mod.rs` | specification, pinned | the envelope: `setup` (keygen from `key_seed` — the same as the bootstrapping's), `generate` (the case: encrypt, then the reference SlotsToCoeffs and ModUp), `serialize` (the halves as canonical bytes), `check` (shape, and precision against the input's coefficients); `WARMUP` |
-| `src/envelope/{keys,case,bytes,check,backend}.rs` | specification, pinned | the envelope's parts; `backend.rs` picks the Poulpy backend from the cargo feature |
-| `src/fherma.rs` | generated, pinned | the types, from the signature: `Point {N, log_delta, output_k, key_seed}`, `Inputs {case_seed}`, `Outputs {re, im}` |
-| `src/main.rs` | generated, pinned | the loop: `setup → init → [generate → warm-up → run → serialize → check]* → free`; point directory in, `out/` and `results.json` out, the clock around `run`. `fherma-lang emit --solution --envelope <signature>` |
-
-## What is measured
-
-One call to `run` per case, wall-clock seconds, after three discarded warm-up
-calls on the first case. Every other stage is timed and reported beside it,
-and none of them is the score:
-
-| In `out/results.json` | Seconds spent |
-|---|---|
-| `setup_s` | the envelope's keygen and compiled bootstrapping context, once |
-| `init_s` | your `init`, once |
-| `warmup_s` | the three warm-up calls, once |
-| per case `generate_s` | the case from its seed: encrypt, SlotsToCoeffs, ModUp |
-| per case `seconds` | **the score**: one `run` |
-| per case `digest_s`, `write_s` | serialising the two halves and writing them |
-| per case `check_s` | decrypting them for their precision |
-| per case `metrics.snr_bits_re`, `snr_bits_im`, `snr_bits` | signal-to-noise ratio in bits of each half against the input's coefficients, scale-invariant — Poulpy's `C2S-PREC` — and the lesser of the two |
-| per case `valid` | the halves have the shape the stage leaves: real-slot ciphertexts at the input's sparsity, narrower than the input |
-| `config` | your `config.jsonc`, as the run saw it |
-| `max_rss_bytes` | the process's peak resident memory, bytes |
-
-## How correctness is judged
-
-By digest against the reference. Each half is serialised canonically —
-`"fherma/ckks-ct/v1"`, then `n, cols, base2k, k, log_delta, slots` as
-little-endian u64, then the limbs carrying the current `k` bits of every
-column as little-endian i64 — and written as `out/NNNNNN/re.bin` and
-`im.bin`. A case with two files is hashed as a set, the runner's recipe:
-sha256 over each file's name, a zero byte and its bytes, in name order
-(`im.bin` then `re.bin`). The platform compares that with what the reference
-produced for the same point and seed. Equal is a pass; there is no tolerance.
-
-## The point and the case
+## What the stage does
 
 | | |
 |---|---|
-| Point | `{N, log_delta, output_k, key_seed}` — the same point as `ckks-bootstrapping/s2c`: it names the preset (`n16_d35_k720_p19_s2c`), and the stage's widths follow from it. Today one: `N=65536, log_delta=35, output_k=720, key_seed=0` |
-| Case | one seed. `cases/NNNNNN/case_seed.bin` holds it as a u64, little-endian; that is the whole input. The stage's input is made from it here, because making it needs the secret |
-| Keys | from the point's `key_seed`: the same keys for everybody at a point, and the same keys as the bootstrapping's |
+| Input | the raised ciphertext: the message encrypted at 160 bits, through the reference SlotsToCoeffs (→ 48 bits) and ModUp (→ 1382 bits, scale 2⁵⁴), made from `case_seed` |
+| Operation | `ckks_coeffs_to_slots_split` on the preset's CoeffsToSlots matrix (four factors, scale 2⁴⁸) with the rotation keys and the conjugation key; then the six guard bits off both halves' scale, as the bootstrap does before EvalMod |
+| Output | two ciphertexts at 1184 bits: `re` holds the input's first `N/2` coefficients in its slots (bit-reversed), `im` the second `N/2`. Two files a case, hashed as a set |
+| Measured on the platform | about 1.9 s (Intel Xeon 6776P, 24 cores, AVX-512 IFMA + Rayon); 54 % of the bootstrap |
 
-Every random stream is `sha256("fherma/ckks-bootstrap/" ‖ seed ‖ "/" ‖ name)`,
-as in the bootstrapping harness: `sk`, `xs`, `xe`, `xa` from `key_seed`;
-`msg`, `input-xa`, `input-xe` from the case seed. The message is `N/2` points
-uniform on the unit disc, drawn with multiplication and comparison only — no
-libm — so it is the same vector bit-for-bit on every platform. The fresh
-ciphertext of a seed here is byte for byte the bootstrapping's input for that
-seed.
+## What to change to make it faster
 
-## Build
+Three files are yours; everything else is the specification's and is laid
+over your repository at every measurement, so a change to it is not measured.
 
-One backend feature, under `[features] default` in `Cargo.toml`:
+| File | Role |
+|---|---|
+| `src/run.rs` | CoeffsToSlots into the two halves. **The only thing timed.** Replace its body with your own algorithm; the output must be the same bytes. |
+| `src/init.rs` | your setup over the point and the keys — buffers, plans, keys onto a GPU. Never sees a case. Not timed. |
+| `src/free.rs` | your teardown. Not timed. |
+| `Cargo.toml` | the Poulpy backend, one cargo feature: `ref`, `avx`, `avx512`, `ifma`, `neon`, each with a `-rayon` variant. The reference builds `ifma-rayon`. |
+| `config.jsonc` | `threads` for a `-rayon` backend; `0` is every core. |
 
-| Feature | Backend | Needs |
-|---|---|---|
-| `ifma`, `ifma-rayon` | `NTT3x42Ifma` | AVX-512F + IFMA + VL — **the reference's** |
-| `avx512`, `avx512-rayon` | `NTT4x30Avx512` | AVX-512F |
-| `avx`, `avx-rayon` | `NTT4x30Avx` | AVX2 + FMA |
-| `neon`, `neon-rayon` | `NTT4x30Neon` | aarch64 |
-| `ref` | `NTT4x30Ref` | nothing; the portable baseline |
+`src/envelope/` (key generation from the seed, the case from its seed, the
+canonical bytes, the precision check) and the generated `src/main.rs`,
+`src/fherma.rs` are the specification's. Correctness is the sha256 of the
+output: it must equal the reference's for the same point and seed, with no
+tolerance. Precision is reported beside the time, not judged.
 
-`*-rayon` backends take `threads` from `config.jsonc`. All are exact NTT
-backends; Poulpy's approximate FFT64 backends are not offered.
-
-The platform builds with `cargo build --release` in the image
-`poulpy-0-8-3` (x86-64 with AVX-512 IFMA; the target features are set by the
-image). Locally, another machine builds another backend:
+## Build, run, submit
 
 ```sh
-RUSTFLAGS="-C target-cpu=native" cargo build --release                       # whatever Cargo.toml selects
-cargo build --release --no-default-features --features neon-rayon            # an Apple M-series
+cargo build --release                                                  # the platform's image: x86-64, AVX-512 IFMA
+cargo build --release --no-default-features --features neon-rayon      # on an Apple M-series
+./target/release/fherma-solution make point --point '{"N":65536,"log_delta":35,"output_k":720,"key_seed":0}' --seeds 1,2
+./target/release/fherma-solution point && cat point/out/results.json
 ```
 
-## Run locally
+The keys alone are about 18 GB: plan for 32 GB and one process at a time. A digest made on another backend or operating system will not equal
+the platform's; the platform judges on its own machines.
 
-The loop and the types come from the signature (any change to them is not
-measured); regenerate them with the language tool, then build:
-
-```sh
-fherma-lang emit --solution --envelope --out . --force ../ckks-coeffs-to-slots-s2c.fkl
-cargo build --release --no-default-features --features neon-rayon
-```
-
-The binary writes a point directory the way the bundle does:
-
-```sh
-./target/release/fherma-solution make point \
-  --point '{"N":65536,"log_delta":35,"output_k":720,"key_seed":0}' --seeds 1,2,3
-./target/release/fherma-solution point
-cat point/out/results.json
-```
-
-And the composition test, from the crate beside this one — one point, one
-case, minutes and the memory of a bootstrap:
-
-```sh
-cd ../ckks-stages-check
-cargo test --release --no-default-features --features neon-rayon -- --nocapture
-```
-
-Locally nothing judges the digest, and a digest made on another backend or
-operating system will not equal the platform's: Poulpy encodes the DFT
-matrices through `f64` and libm at `compile`, and the encoder's FFT differs
-between backends at this scale (a Poulpy issue, being fixed). The platform
-judges on its own machines, all running the same image and backend. Run
-locally to see that it builds, runs, reaches the precision and passes the
-composition test; leave the equality to the platform.
-
-## What it costs
-
-At this point, NEON + rayon × 8, Apple M3 Max (a loaded machine; the shares
-hold, the seconds vary): `setup` 70 s, `generate` 30–40 s per case (SlotsToCoeffs
-and ModUp), one `run` 34–52 s, `snr_bits` 36.6. Output per case 2 × 24 117 313
-bytes. Memory as the bootstrapping's: the keys alone are about 18 GB; plan for
-32 GB and one process at a time.
-
-## Submitting
-
-Push this directory to a repository. On the platform, create an
-implementation of `coeffs-to-slots` answering `s2c@1.0.0`: repository and
-commit, harness language `rust`, runtime image `poulpy-0-8-3`. Run it. The
-first run of a new point waits for the reference's own run to produce the
-digests; after that a run is judged as it finishes.
+To submit: `fherma implementation init coeffs-to-slots/s2c@1.0.0` writes this
+layout for you; push your repository and register the commit on the
+platform. See the [documentation](https://www.fherma.io/docs/solution-kinds).
